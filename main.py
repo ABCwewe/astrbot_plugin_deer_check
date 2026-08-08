@@ -7,6 +7,7 @@ import asyncio
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
+from astrbot.api.message_components import At
 from astrbot.core.star import StarTools
 from .resources.deer_core import DeerCore
 from .resources.klittra_core import KlittraCore
@@ -147,9 +148,25 @@ class DeerCheckinPlugin(Star):
         except Exception as e:
             logger.error(f"月度数据清理失败: {e}")
 
-    @filter.regex(r'^🦌+$')
+    def _get_checkin_target(self, event: AstrMessageEvent):
+        """
+        解析消息中 @ 的目标用户，用于帮别人打卡。
+        返回 (target_user_id, at_name)；没有有效 @（未@、@机器人、@全体）时返回 (None, None)。
+        """
+        self_id = getattr(getattr(event, "message_obj", None), "self_id", None)
+        for comp in event.message_obj.message:
+            if isinstance(comp, At):
+                qq = str(comp.qq)
+                if qq == "all":
+                    continue  # @全体成员，不视为打卡对象
+                if self_id and qq == str(self_id):
+                    continue  # @机器人本身，不视为打卡对象
+                return qq, (comp.name or "")
+        return None, None
+
+    @filter.regex(r'^🦌+\s*(@.*)?\s*$')
     async def handle_deer_checkin(self, event: AstrMessageEvent):
-        """处理鹿打卡事件：记录数据，然后发送日历。"""
+        """处理鹿打卡事件：记录数据，然后发送日历。支持 @ 他人帮打卡。"""
         # 检查群组白名单和用户黑名单
         group_id = event.get_group_id()
         user_id = event.get_sender_id()
@@ -163,6 +180,16 @@ class DeerCheckinPlugin(Star):
         await self._ensure_initialized()
         user_name = event.get_sender_name()
         deer_count = event.message_str.count("🦌")
+
+        # 解析 @ 目标：被 @ 的用户作为打卡对象（帮别人打卡）
+        target_id, at_name = self._get_checkin_target(event)
+        sender_id = user_id
+        if target_id is None:
+            user_id = sender_id
+        else:
+            user_id = target_id
+            user_name = at_name or await self._get_user_name(event, target_id)
+        is_for_other = str(user_id) != str(sender_id)
 
         current_time = datetime.now()
         today_str = self._get_adjusted_date(current_time)
@@ -226,12 +253,16 @@ class DeerCheckinPlugin(Star):
             yield event.plain_result("打卡失败，数据库出错了 >_<")
             return
 
-        async for result in self._generate_and_send_calendar(event, today_str):
+        # 帮他人打卡时先发送确认提示
+        if is_for_other:
+            yield event.plain_result(f"已替 {user_name} 打卡 {deer_count} 个🦌！")
+
+        async for result in self._generate_and_send_calendar(event, today_str, user_id=user_id, user_name=user_name):
             yield result
 
-    @filter.regex(r'^🤏+$')
+    @filter.regex(r'^🤏+\s*(@.*)?\s*$')
     async def handle_klittra_checkin(self, event: AstrMessageEvent):
-        """处理扣日历记录事件：如果启用了扣日历功能，则记录数据并发送扣日历。"""
+        """处理扣日历记录事件：如果启用了扣日历功能，则记录数据并发送扣日历。支持 @ 他人帮记录。"""
         # 检查是否启用了扣日历功能
         if not self.enable_female_calendar:
             return  # 未启用扣日历功能，不处理
@@ -249,6 +280,16 @@ class DeerCheckinPlugin(Star):
         await self._ensure_initialized()
         user_name = event.get_sender_name()
         pinch_count = event.message_str.count("🤏")
+
+        # 解析 @ 目标：被 @ 的用户作为记录对象（帮别人记录）
+        target_id, at_name = self._get_checkin_target(event)
+        sender_id = user_id
+        if target_id is None:
+            user_id = sender_id
+        else:
+            user_id = target_id
+            user_name = at_name or await self._get_user_name(event, target_id)
+        is_for_other = str(user_id) != str(sender_id)
 
         current_time = datetime.now()
         today_str = self._get_adjusted_date(current_time)
@@ -312,10 +353,11 @@ class DeerCheckinPlugin(Star):
             yield event.plain_result("扣日历记录失败，数据库出错了 >_<")
             return
 
-        # 发送扣日历
-        user_id = event.get_sender_id()
-        user_name = event.get_sender_name()
+        # 帮他人记录时先发送确认提示
+        if is_for_other:
+            yield event.plain_result(f"已替 {user_name} 记录 {pinch_count} 个🤏！")
 
+        # 发送扣日历
         result_text, image_path, has_error = await self.klittra_core._generate_and_send_klittra_calendar(
             event, user_id, user_name, self.klittra_db_path, today_str
         )
@@ -559,6 +601,148 @@ class DeerCheckinPlugin(Star):
         async for result in self._generate_and_send_calendar(event, adjusted_date_str):
             yield result
 
+    @filter.regex(r'^🤏补签\s+(\d{1,2})(?:\s+(\d+))?\s*$')
+    async def handle_klittra_retro_checkin(self, event: AstrMessageEvent):
+        """
+        处理扣日历补签命令，格式: '🤏补签 <日期> [次数]'，与 🦌补签 功能对齐。
+        """
+        # 检查是否启用了扣日历功能
+        if not self.enable_female_calendar:
+            return  # 未启用扣日历功能，不处理
+
+        # 检查群组白名单和用户黑名单
+        group_id = event.get_group_id()
+        user_id = event.get_sender_id()
+
+        if self.group_whitelist and int(group_id) not in self.group_whitelist:
+            return  # 不在白名单中的群组不处理
+
+        if user_id in self.user_blacklist:
+            return  # 黑名单用户不处理
+
+        await self._ensure_initialized()
+
+        # 在函数内部，对消息原文进行正则搜索
+        pattern = r'^🤏补签\s+(\d{1,2})(?:\s+(\d+))?\s*$'
+        match = re.search(pattern, event.message_str)
+
+        if not match:
+            logger.error("扣日历补签处理器被触发，但内部正则匹配失败！这不应该发生。")
+            return
+
+        user_name = event.get_sender_name()
+
+        # 从 match 对象中解析日期和次数
+        try:
+            day_str, count_str = match.groups()
+            day_to_checkin = int(day_str)
+            pinch_count = int(count_str) if count_str else 1
+            if pinch_count <= 0:
+                yield event.plain_result("补签次数必须是大于0的整数哦！")
+                return
+        except (ValueError, TypeError):
+            yield event.plain_result("命令格式不正确，请使用：🤏补签 日期 [次数] (例如：🤏补签 1 5 或 🤏补签 1)")
+            return
+
+        # 验证日期有效性
+        current_time = datetime.now()
+        adjusted_date_str = self._get_adjusted_date(current_time)
+        adjusted_date = datetime.strptime(adjusted_date_str, "%Y-%m-%d").date()
+        current_year = adjusted_date.year
+        current_month = adjusted_date.month
+
+        days_in_month = calendar.monthrange(current_year, current_month)[1]
+
+        if not (1 <= day_to_checkin <= days_in_month):
+            yield event.plain_result(f"日期无效！本月（{current_month}月）只有 {days_in_month} 天。")
+            return
+
+        if day_to_checkin > adjusted_date.day:
+            yield event.plain_result("抱歉，不能对未来进行补签哦！")
+            return
+
+        # 添加补签日期并更新数据库
+        target_date = date(current_year, current_month, day_to_checkin)
+        target_date_str = target_date.strftime("%Y-%m-%d")
+
+        # 检查每日和每月计入次数限制（针对补签日期，复用 deer 的限制配置）
+        if self.daily_max_checkins > 0 or self.monthly_max_checkins > 0:
+            # 查询当前日期和当前月份的打卡次数
+            async with aiosqlite.connect(self.klittra_db_path) as conn:
+                # 查询当日打卡次数
+                if self.daily_max_checkins > 0:
+                    cursor = await conn.execute('''
+                        SELECT klittra_count FROM klittra_checkin WHERE user_id = ? AND checkin_date = ?
+                    ''', (user_id, target_date_str))
+                    today_record = await cursor.fetchone()
+
+                    current_daily_count = today_record[0] if today_record else 0
+                    new_daily_count = current_daily_count + pinch_count
+
+                    if new_daily_count > self.daily_max_checkins:
+                        yield event.plain_result(f"补签失败！{target_date_str} 当日计入次数已达上限 {self.daily_max_checkins} 次。")
+                        return
+
+                # 查询当月打卡次数
+                if self.monthly_max_checkins > 0:
+                    current_month = target_date_str[:7]  # YYYY-MM 格式
+                    # 查询本月其他日期的总次数
+                    cursor = await conn.execute('''
+                        SELECT SUM(klittra_count) FROM klittra_checkin
+                        WHERE user_id = ? AND strftime('%Y-%m', checkin_date) = ? AND checkin_date != ?
+                    ''', (user_id, current_month, target_date_str))
+                    monthly_record = await cursor.fetchone()
+
+                    current_monthly_count = monthly_record[0] if monthly_record and monthly_record[0] is not None else 0
+
+                    # 查询目标日期已有的数量
+                    cursor = await conn.execute('''
+                        SELECT klittra_count FROM klittra_checkin WHERE user_id = ? AND checkin_date = ?
+                    ''', (user_id, target_date_str))
+                    today_record = await cursor.fetchone()
+                    existing_count = today_record[0] if today_record and today_record[0] is not None else 0
+
+                    # 计算补签后的总数
+                    new_monthly_count = current_monthly_count + existing_count + pinch_count
+
+                    if new_monthly_count > self.monthly_max_checkins:
+                        yield event.plain_result(f"补签失败！本月计入次数已达上限 {self.monthly_max_checkins} 次。")
+                        return
+
+        try:
+            async with aiosqlite.connect(self.klittra_db_path) as conn:
+                await conn.execute('''
+                    INSERT INTO klittra_checkin (user_id, checkin_date, klittra_count)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(user_id, checkin_date)
+                    DO UPDATE SET klittra_count = klittra_count + excluded.klittra_count;
+                ''', (user_id, target_date_str, pinch_count))
+                await conn.commit()
+            logger.info(f"用户 {user_name} ({user_id}) 成功为 {target_date_str} 补签了 {pinch_count} 个🤏。")
+        except Exception as e:
+            logger.error(f"为用户 {user_name} ({user_id}) 补签失败: {e}")
+            yield event.plain_result("补签失败，数据库出错了 >_<")
+            return
+
+        # 发送成功提示，并返回更新后的扣日历图片
+        yield event.plain_result(f"补签成功！已为 {current_month}月{day_to_checkin}日 增加了 {pinch_count} 个🤏。")
+        result_text, image_path, has_error = await self.klittra_core._generate_and_send_klittra_calendar(
+            event, user_id, user_name, self.klittra_db_path, adjusted_date_str
+        )
+        if result_text:
+            yield event.plain_result(result_text)
+            if has_error:
+                return
+        if image_path:
+            yield event.image_result(image_path)
+        # 删除临时图片文件
+        if image_path and os.path.exists(image_path):
+            try:
+                await asyncio.to_thread(os.remove, image_path)
+                logger.debug(f"已成功删除临时图片: {image_path}")
+            except OSError as e:
+                logger.error(f"删除临时图片 {image_path} 失败: {e}")
+
     @filter.regex(r'^🦌撤销\s+(\d{1,2})(?:\s+(\d+))?\s*$')
     async def handle_undo_checkin(self, event: AstrMessageEvent):
         """
@@ -650,6 +834,114 @@ class DeerCheckinPlugin(Star):
         adjusted_date_str = self._get_adjusted_date(current_time)
         async for result in self._generate_and_send_calendar(event, adjusted_date_str):
             yield result
+
+    @filter.regex(r'^🤏撤销\s+(\d{1,2})(?:\s+(\d+))?\s*$')
+    async def handle_klittra_undo_checkin(self, event: AstrMessageEvent):
+        """
+        处理扣日历撤销命令，格式: '🤏撤销 <日期> [次数]'，与 🦌撤销 功能对齐。
+        """
+        # 检查是否启用了扣日历功能
+        if not self.enable_female_calendar:
+            return  # 未启用扣日历功能，不处理
+
+        # 检查群组白名单和用户黑名单
+        group_id = event.get_group_id()
+        user_id = event.get_sender_id()
+
+        if self.group_whitelist and int(group_id) not in self.group_whitelist:
+            return  # 不在白名单中的群组不处理
+
+        if user_id in self.user_blacklist:
+            return  # 黑名单用户不处理
+
+        await self._ensure_initialized()
+
+        # 在函数内部，对消息原文进行正则搜索
+        pattern = r'^🤏撤销\s+(\d{1,2})(?:\s+(\d+))?\s*$'
+        match = re.search(pattern, event.message_str)
+
+        if not match:
+            logger.error("扣日历撤销处理器被触发，但内部正则匹配失败！这不应该发生。")
+            return
+
+        user_name = event.get_sender_name()
+
+        # 从 match 对象中解析日期和次数
+        try:
+            day_str, count_str = match.groups()
+            day_to_checkin = int(day_str)
+            pinch_count = int(count_str) if count_str else 1
+            if pinch_count <= 0:
+                yield event.plain_result("撤销次数必须是大于0的整数哦！")
+                return
+        except (ValueError, TypeError):
+            yield event.plain_result("命令格式不正确，请使用：🤏撤销 日期 [次数] (例如：🤏撤销 1 5 或 🤏撤销 1)")
+            return
+
+        # 验证日期有效性
+        current_time = datetime.now()
+        adjusted_date_str = self._get_adjusted_date(current_time)
+        adjusted_date = datetime.strptime(adjusted_date_str, "%Y-%m-%d").date()
+        current_year = adjusted_date.year
+        current_month = adjusted_date.month
+
+        days_in_month = calendar.monthrange(current_year, current_month)[1]
+
+        if not (1 <= day_to_checkin <= days_in_month):
+            yield event.plain_result(f"日期无效！本月（{current_month}月）只有 {days_in_month} 天。")
+            return
+
+        if day_to_checkin > adjusted_date.day:
+            yield event.plain_result("抱歉，不能对未来进行撤销哦！")
+            return
+
+        # 数据库操作
+        target_date = date(current_year, current_month, day_to_checkin)
+        target_date_str = target_date.strftime("%Y-%m-%d")
+
+        try:
+            async with aiosqlite.connect(self.klittra_db_path) as conn:
+                # 查询当前记录
+                cursor = await conn.execute("SELECT klittra_count FROM klittra_checkin WHERE user_id = ? AND checkin_date = ?", (user_id, target_date_str))
+                record = await cursor.fetchone()
+                
+                if not record or record[0] < pinch_count:
+                    current_count = record[0] if record else 0
+                    yield event.plain_result(f"撤销失败！{target_date_str} 的扣日历次数仅为 {current_count}，不足以减少 {pinch_count} 次。")
+                    return
+                
+                # 执行更新
+                new_count = record[0] - pinch_count
+                if new_count == 0:
+                    await conn.execute("DELETE FROM klittra_checkin WHERE user_id = ? AND checkin_date = ?", (user_id, target_date_str))
+                else:
+                    await conn.execute("UPDATE klittra_checkin SET klittra_count = ? WHERE user_id = ? AND checkin_date = ?", (new_count, user_id, target_date_str))
+                await conn.commit()
+            
+            logger.info(f"用户 {user_name} ({user_id}) 成功为 {target_date_str} 撤销了 {pinch_count} 个🤏。")
+        except Exception as e:
+            logger.error(f"为用户 {user_name} ({user_id}) 撤销失败: {e}")
+            yield event.plain_result("撤销失败，数据库出错了 >_<")
+            return
+
+        # 发送成功提示，并返回更新后的扣日历图片
+        yield event.plain_result(f"撤销成功！已为 {current_month}月{day_to_checkin}日 减少了 {pinch_count} 个🤏。")
+        result_text, image_path, has_error = await self.klittra_core._generate_and_send_klittra_calendar(
+            event, user_id, user_name, self.klittra_db_path, adjusted_date_str
+        )
+        if result_text:
+            yield event.plain_result(result_text)
+            if has_error:
+                return
+        if image_path:
+            yield event.image_result(image_path)
+        # 删除临时图片文件
+        if image_path and os.path.exists(image_path):
+            try:
+                await asyncio.to_thread(os.remove, image_path)
+                logger.debug(f"已成功删除临时图片: {image_path}")
+            except OSError as e:
+                logger.error(f"删除临时图片 {image_path} 失败: {e}")
 
     @filter.regex(r'^🦌生涯$')
     async def handle_deer_career(self, event: AstrMessageEvent):
@@ -1691,8 +1983,8 @@ class DeerCheckinPlugin(Star):
             "--- 🦌打卡帮助菜单 ---\n\n"
             "1️⃣  🦌打卡\n"
             "    ▸ 命令: 直接发送 🦌 (可发送多个)\n"
-            "    ▸ 作用: 记录今天🦌的数量。\n"
-            "    ▸ 示例: 🦌🦌🦌\n\n"
+            "    ▸ 作用: 记录今天🦌的数量。@他人可为对方打卡。\n"
+            "    ▸ 示例: 🦌🦌🦌 或 🦌 @张三\n\n"
             "2️⃣  查看记录\n"
             "    ▸ 命令: 🦌日历\n"
             "    ▸ 作用: 查看您本月的打卡日历，不记录打卡。\n\n"
@@ -1721,6 +2013,32 @@ class DeerCheckinPlugin(Star):
             "    ▸ 示例: 🦌撤销 1 5 (为本月1号减少5次)，🦌撤销 1 (为本月1号减少1次)\n\n"
             "9️⃣  显示此帮助\n"
             "    ▸ 命令: 🦌帮助\n\n"
+            "--- 🤏扣日历帮助 (需在配置中启用“女生日历”) ---\n\n"
+            "🔟  🤏打卡\n"
+            "    ▸ 命令: 直接发送 🤏 (可发送多个)\n"
+            "    ▸ 作用: 记录今天🤏的数量。@他人可为对方记录。\n"
+            "    ▸ 示例: 🤏🤏🤏 或 🤏 @张三\n\n"
+            "1️⃣1️⃣  查看记录\n"
+            "    ▸ 命令: 🤏日历\n"
+            "    ▸ 作用: 查看您本月的扣日历，不记录。\n\n"
+            "1️⃣2️⃣  查看年度记录\n"
+            "    ▸ 命令: 🤏年历 [年份]\n"
+            "    ▸ 作用: 查看完整扣日历。不带年份默认查看今年。\n\n"
+            "1️⃣3️⃣  查看指定月份记录\n"
+            "    ▸ 命令: 🤏月历 月份数字\n"
+            "    ▸ 作用: 查看指定月份的扣日历。\n"
+            "    ▸ 示例: 🤏月历 11\n\n"
+            "1️⃣4️⃣  补签\n"
+            "    ▸ 命令: 🤏补签 [日期] [次数]\n"
+            "    ▸ 作用: 为本月指定日期补上扣日历记录。\n"
+            "    ▸ 示例: 🤏补签 1 5，🤏补签 1\n\n"
+            "1️⃣5️⃣  撤销\n"
+            "    ▸ 命令: 🤏撤销 [日期] [次数]\n"
+            "    ▸ 作用: 为本月指定日期减少扣日历记录。\n"
+            "    ▸ 示例: 🤏撤销 1 5，🤏撤销 1\n\n"
+            "1️⃣6️⃣  排行\n"
+            "    ▸ 命令: 🤏排行\n"
+            "    ▸ 作用: 查看本月的扣日历排行榜。\n\n"
             "祝您一🦌顺畅！"
         )
 
@@ -1780,10 +2098,10 @@ class DeerCheckinPlugin(Star):
         """
         return self.deer_core._create_calendar_image(user_id, user_name, year, month, checkin_data, total_deer)
 
-    async def _generate_and_send_calendar(self, event: AstrMessageEvent, adjusted_date_str: str = None):
-        """查询和生成当月的打卡日历。"""
-        user_id = event.get_sender_id()
-        user_name = event.get_sender_name()
+    async def _generate_and_send_calendar(self, event: AstrMessageEvent, adjusted_date_str: str = None, user_id: str = None, user_name: str = None):
+        """查询和生成当月的打卡日历。user_id/user_name 可指定为其他用户（帮别人打卡/查询）。"""
+        user_id = user_id or event.get_sender_id()
+        user_name = user_name or event.get_sender_name()
 
         # 使用 deer_core 方法
         result_text, image_path, has_error = await self.deer_core._generate_and_send_calendar(
